@@ -4,6 +4,7 @@
 
 use crate::ctap2::commands::client_pin::PinUvAuthTokenPermission;
 use crate::ctap2::commands::get_info::{AuthenticatorInfo, AuthenticatorVersion};
+use crate::ctap2::commands::Command;
 use crate::errors::AuthenticatorError;
 use crate::{ctap2::commands::CommandError, transport::errors::HIDError};
 use serde::{
@@ -331,6 +332,7 @@ impl SharedSecret {
             pin_protocol: self.pin_protocol.clone(),
             pin_token,
             permissions,
+            command: None,
         })
     }
     pub fn authenticate(&self, message: &[u8]) -> Result<Vec<u8>, CryptoError> {
@@ -366,9 +368,32 @@ pub struct PinUvAuthToken {
     pub pin_protocol: PinUvAuthProtocol,
     pin_token: Vec<u8>,
     pub permissions: PinUvAuthTokenPermission,
+    /// The command this token was obtained for. Tokens are bound to that
+    /// command and must not be reused for a different one.
+    command: Option<Command>,
 }
 
 impl PinUvAuthToken {
+    /// Record the command this token was obtained for. Called right after
+    /// the token was fetched from the authenticator.
+    pub(crate) fn set_command(&mut self, command: Command) {
+        self.command = Some(command);
+    }
+
+    /// Check if this token may be used for the given command. The command
+    /// always has to match the one the token was obtained for. If the
+    /// device supports the CTAP2.1 permission system, the token also needs
+    /// to have the required permission.
+    pub(crate) fn is_valid_for(
+        &self,
+        command: &Command,
+        permission: PinUvAuthTokenPermission,
+        permission_system: bool,
+    ) -> bool {
+        self.command.as_ref() == Some(command)
+            && (!permission_system || self.permissions.contains(permission))
+    }
+
     pub fn derive(self, message: &[u8]) -> Result<PinUvAuthParam, CryptoError> {
         let pin_auth = self.pin_protocol.0.authenticate(&self.pin_token, message)?;
         Ok(PinUvAuthParam {
@@ -376,6 +401,25 @@ impl PinUvAuthToken {
             pin_protocol: self.pin_protocol,
             permissions: self.permissions,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn create_test(
+        pin_protocol: u64,
+        permissions: PinUvAuthTokenPermission,
+        command: Option<Command>,
+    ) -> Self {
+        let pin_protocol = PinUvAuthProtocol::try_from(&AuthenticatorInfo {
+            pin_protocols: Some(vec![pin_protocol]),
+            ..Default::default()
+        })
+        .expect("Failed to create PIN protocol");
+        Self {
+            pin_protocol,
+            pin_token: vec![0x01; 32],
+            permissions,
+            command,
+        }
     }
 }
 

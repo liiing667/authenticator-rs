@@ -144,6 +144,9 @@ macro_rules! handle_errors {
                 // repeatedly, so that we have to fall back to PINs
                 $skip_uv = true;
                 $skip_puap = false;
+                // The cached PUAT (if any) was obtained via UV and must not be
+                // reused for the next command. Drop it.
+                $cached_puat = false;
                 continue;
             }
             HIDError::Command(CommandError::StatusCode(StatusCode::CredentialExcluded, _)) => {
@@ -285,9 +288,10 @@ fn get_pin_uv_auth_param<Dev: FidoDevice, T: PinUvAuthCommand + RequestCtap2>(
     if info.options.pin_uv_auth_token == Some(true) {
         if !skip_uv && supports_uv {
             // CTAP 2.1 - UV
-            let pin_auth_token = dev
+            let mut pin_auth_token = dev
                 .get_pin_uv_auth_token_using_uv_with_permissions(permission, cmd.get_rp_id(), alive)
                 .map_err(|e| repackage_pin_errors(dev, e))?;
+            pin_auth_token.set_command(cmd.command());
             cmd.set_pin_uv_auth_param(Some(pin_auth_token.clone()))?;
             Ok(PinUvAuthResult::SuccessGetPinUvAuthTokenUsingUvWithPermissions(pin_auth_token))
         } else {
@@ -296,7 +300,7 @@ fn get_pin_uv_auth_param<Dev: FidoDevice, T: PinUvAuthCommand + RequestCtap2>(
             // `(skip_uv || !supports_uv)`. Moreover we did not exit early in the
             // `(skip_uv || !supports_uv) && !pin_configured` case. So we have
             // `pin_configured`.
-            let pin_auth_token = dev
+            let mut pin_auth_token = dev
                 .get_pin_uv_auth_token_using_pin_with_permissions(
                     pin,
                     permission,
@@ -304,6 +308,7 @@ fn get_pin_uv_auth_param<Dev: FidoDevice, T: PinUvAuthCommand + RequestCtap2>(
                     alive,
                 )
                 .map_err(|e| repackage_pin_errors(dev, e))?;
+            pin_auth_token.set_command(cmd.command());
             cmd.set_pin_uv_auth_param(Some(pin_auth_token.clone()))?;
             Ok(PinUvAuthResult::SuccessGetPinUvAuthTokenUsingPinWithPermissions(pin_auth_token))
         }
@@ -323,9 +328,10 @@ fn get_pin_uv_auth_param<Dev: FidoDevice, T: PinUvAuthCommand + RequestCtap2>(
             return Ok(PinUvAuthResult::UsingInternalUv);
         }
 
-        let pin_auth_token = dev
+        let mut pin_auth_token = dev
             .get_pin_token(pin, alive)
             .map_err(|e| repackage_pin_errors(dev, e))?;
+        pin_auth_token.set_command(cmd.command());
         cmd.set_pin_uv_auth_param(Some(pin_auth_token.clone()))?;
         Ok(PinUvAuthResult::SuccessGetPinToken(pin_auth_token))
     }
@@ -994,21 +1000,22 @@ pub(crate) fn bio_enrollment(
     let mut pin_uv_auth_result = puat_result
         .clone()
         .unwrap_or(PinUvAuthResult::NoAuthRequired);
-    // See, if we have a cached PUAT with matching permissions.
-    match puat_result {
-        Some(PinUvAuthResult::SuccessGetPinToken(t))
-        | Some(PinUvAuthResult::SuccessGetPinUvAuthTokenUsingUvWithPermissions(t))
-        | Some(PinUvAuthResult::SuccessGetPinUvAuthTokenUsingPinWithPermissions(t))
-            if !authinfo.versions.contains(&AuthenticatorVersion::FIDO_2_1) // Only 2.1 has a permission-system
-                || use_legacy_preview // Preview doesn't use permissions
-                || t.permissions
-                    .contains(PinUvAuthTokenPermission::BioEnrollment) =>
-        {
-            skip_puap = true;
-            cached_puat = true;
-            unwrap_result!(bio_cmd.set_pin_uv_auth_param(Some(t)), callback);
-        }
-        _ => {}
+    // See, if we have a cached PUAT for this command, with matching
+    // permissions and UV-state.
+    // Only CTAP2.1 has a permission-system and the preview doesn't use permissions.
+    let permission_system =
+        authinfo.versions.contains(&AuthenticatorVersion::FIDO_2_1) && !use_legacy_preview;
+    if let Some(token) = puat_result.as_ref().and_then(|result| {
+        result.get_reusable_pin_uv_auth_token(
+            &bio_cmd.command(),
+            PinUvAuthTokenPermission::BioEnrollment,
+            skip_uv,
+            permission_system,
+        )
+    }) {
+        skip_puap = true;
+        cached_puat = true;
+        unwrap_result!(bio_cmd.set_pin_uv_auth_param(Some(token)), callback);
     }
     let mut pin = None;
     while alive() {
@@ -1264,21 +1271,22 @@ pub fn credential_management<Dev: FidoDevice>(
     let mut pin_uv_auth_result = puat_result
         .clone()
         .unwrap_or(PinUvAuthResult::NoAuthRequired);
-    // See, if we have a cached PUAT with matching permissions.
-    match puat_result {
-        Some(PinUvAuthResult::SuccessGetPinToken(t))
-        | Some(PinUvAuthResult::SuccessGetPinUvAuthTokenUsingUvWithPermissions(t))
-        | Some(PinUvAuthResult::SuccessGetPinUvAuthTokenUsingPinWithPermissions(t))
-            if !authinfo.versions.contains(&AuthenticatorVersion::FIDO_2_1) // Only 2.1 has a permission-system
-                || use_legacy_preview // Preview doesn't use permissions
-                || t.permissions
-                    .contains(PinUvAuthTokenPermission::CredentialManagement) =>
-        {
-            skip_puap = true;
-            cached_puat = true;
-            unwrap_result!(cred_management.set_pin_uv_auth_param(Some(t)), callback);
-        }
-        _ => {}
+    // See, if we have a cached PUAT for this command, with matching
+    // permissions and UV-state.
+    // Only CTAP2.1 has a permission-system and the preview doesn't use permissions.
+    let permission_system =
+        authinfo.versions.contains(&AuthenticatorVersion::FIDO_2_1) && !use_legacy_preview;
+    if let Some(token) = puat_result.as_ref().and_then(|result| {
+        result.get_reusable_pin_uv_auth_token(
+            &cred_management.command(),
+            PinUvAuthTokenPermission::CredentialManagement,
+            skip_uv,
+            permission_system,
+        )
+    }) {
+        skip_puap = true;
+        cached_puat = true;
+        unwrap_result!(cred_management.set_pin_uv_auth_param(Some(token)), callback);
     }
     let mut pin = None;
     while alive() {
@@ -1546,18 +1554,20 @@ pub(crate) fn configure_authenticator(
     let mut pin_uv_auth_result = puat_result
         .clone()
         .unwrap_or(PinUvAuthResult::NoAuthRequired);
-    match puat_result {
-        Some(PinUvAuthResult::SuccessGetPinToken(t))
-        | Some(PinUvAuthResult::SuccessGetPinUvAuthTokenUsingUvWithPermissions(t))
-        | Some(PinUvAuthResult::SuccessGetPinUvAuthTokenUsingPinWithPermissions(t))
-            if t.permissions
-                .contains(PinUvAuthTokenPermission::AuthenticatorConfiguration) =>
-        {
-            skip_puap = true;
-            cached_puat = true;
-            unwrap_result!(authcfg.set_pin_uv_auth_param(Some(t)), callback);
-        }
-        _ => {}
+    // See, if we have a cached PUAT for this command, with matching
+    // permissions and UV-state. The AuthenticatorConfig-command requires
+    // CTAP2.1, so the permission-system is always in effect here.
+    if let Some(token) = puat_result.as_ref().and_then(|result| {
+        result.get_reusable_pin_uv_auth_token(
+            &authcfg.command(),
+            PinUvAuthTokenPermission::AuthenticatorConfiguration,
+            skip_uv,
+            true,
+        )
+    }) {
+        skip_puap = true;
+        cached_puat = true;
+        unwrap_result!(authcfg.set_pin_uv_auth_param(Some(token)), callback);
     }
     let mut pin = None;
     while alive() {

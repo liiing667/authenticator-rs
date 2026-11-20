@@ -3,7 +3,9 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use crate::crypto::{CryptoError, PinUvAuthParam, PinUvAuthToken};
-use crate::ctap2::commands::client_pin::{GetPinRetries, GetUvRetries, PinError};
+use crate::ctap2::commands::client_pin::{
+    GetPinRetries, GetUvRetries, PinError, PinUvAuthTokenPermission,
+};
 use crate::ctap2::commands::get_info::AuthenticatorInfo;
 use crate::ctap2::server::UserVerificationRequirement;
 use crate::errors::AuthenticatorError;
@@ -137,6 +139,49 @@ impl PinUvAuthResult {
             PinUvAuthResult::SuccessGetPinUvAuthTokenUsingPinWithPermissions(token) => {
                 Some(token.clone())
             }
+        }
+    }
+
+    /// Check if this (potentially cached) result may be reused for the given
+    /// command, and if so, return the pinUvAuthToken.
+    ///
+    /// The current command, the granted permissions and the UV-state all have
+    /// to match. Otherwise the token must not be reused and a new one has to
+    /// be established, e.g. after the previous command was cancelled or user
+    /// verification failed.
+    ///
+    /// `permission` is the permission the current command requires and
+    /// `skip_uv` indicates whether UV must not be used for it. Tokens that
+    /// were obtained via internal UV are not reusable in that case.
+    /// `permission_system` indicates whether the device supports the CTAP2.1
+    /// permission system. Without it, permissions are meaningless and only
+    /// the command-binding is enforced.
+    pub(crate) fn get_reusable_pin_uv_auth_token(
+        &self,
+        command: &Command,
+        permission: PinUvAuthTokenPermission,
+        skip_uv: bool,
+        permission_system: bool,
+    ) -> Option<PinUvAuthToken> {
+        match self {
+            // CTAP2.0 pin tokens have no permissions and are not bound to a
+            // specific command. They can only be reused if the device does
+            // not support the CTAP2.1 permission system.
+            PinUvAuthResult::SuccessGetPinToken(token) if !permission_system => Some(token.clone()),
+            PinUvAuthResult::SuccessGetPinUvAuthTokenUsingPinWithPermissions(token)
+                if token.is_valid_for(command, permission, permission_system) =>
+            {
+                Some(token.clone())
+            }
+            // Tokens obtained via internal UV must not be reused if UV is
+            // not allowed for the current command, e.g. because UV got
+            // blocked or the command requires a PIN-obtained token.
+            PinUvAuthResult::SuccessGetPinUvAuthTokenUsingUvWithPermissions(token)
+                if !skip_uv && token.is_valid_for(command, permission, permission_system) =>
+            {
+                Some(token.clone())
+            }
+            _ => None,
         }
     }
 }
@@ -550,4 +595,229 @@ fn assert_canonical_cbor_encoding<T: Serialize + fmt::Debug>(value: &T) {
     }
 
     assert_has_no_tags(&opaque_value);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Command, PinUvAuthResult, PinUvAuthToken, PinUvAuthTokenPermission};
+
+    fn token(
+        pin_protocol: u64,
+        permissions: PinUvAuthTokenPermission,
+        command: Command,
+    ) -> PinUvAuthToken {
+        PinUvAuthToken::create_test(pin_protocol, permissions, Some(command))
+    }
+
+    #[test]
+    fn reusable_pin_token_for_same_command() {
+        // PIN protocol 1 and 2, obtained via PIN: reusable for the same
+        // command with sufficient permissions.
+        for protocol in [1, 2] {
+            let result = PinUvAuthResult::SuccessGetPinUvAuthTokenUsingPinWithPermissions(token(
+                protocol,
+                PinUvAuthTokenPermission::BioEnrollment,
+                Command::BioEnrollment,
+            ));
+            assert!(result
+                .get_reusable_pin_uv_auth_token(
+                    &Command::BioEnrollment,
+                    PinUvAuthTokenPermission::BioEnrollment,
+                    false,
+                    true,
+                )
+                .is_some());
+        }
+    }
+
+    #[test]
+    fn reusable_uv_token_for_same_command() {
+        // PIN protocol 1 and 2, obtained via UV: reusable for the same
+        // command, if UV is still allowed.
+        for protocol in [1, 2] {
+            let result = PinUvAuthResult::SuccessGetPinUvAuthTokenUsingUvWithPermissions(token(
+                protocol,
+                PinUvAuthTokenPermission::CredentialManagement,
+                Command::CredentialManagement,
+            ));
+            assert!(result
+                .get_reusable_pin_uv_auth_token(
+                    &Command::CredentialManagement,
+                    PinUvAuthTokenPermission::CredentialManagement,
+                    false,
+                    true,
+                )
+                .is_some());
+        }
+    }
+
+    #[test]
+    fn not_reusable_for_different_command() {
+        // A token obtained for one command must not be reused for another,
+        // even if the permissions would be sufficient.
+        let result = PinUvAuthResult::SuccessGetPinUvAuthTokenUsingPinWithPermissions(token(
+            2,
+            PinUvAuthTokenPermission::MakeCredential | PinUvAuthTokenPermission::GetAssertion,
+            Command::MakeCredentials,
+        ));
+        assert!(result
+            .get_reusable_pin_uv_auth_token(
+                &Command::GetAssertion,
+                PinUvAuthTokenPermission::GetAssertion,
+                false,
+                true,
+            )
+            .is_none());
+        // But it is reusable for the command it was obtained for.
+        assert!(result
+            .get_reusable_pin_uv_auth_token(
+                &Command::MakeCredentials,
+                PinUvAuthTokenPermission::MakeCredential,
+                false,
+                true,
+            )
+            .is_some());
+    }
+
+    #[test]
+    fn not_reusable_with_insufficient_permissions() {
+        let result = PinUvAuthResult::SuccessGetPinUvAuthTokenUsingPinWithPermissions(token(
+            1,
+            PinUvAuthTokenPermission::GetAssertion,
+            Command::BioEnrollment,
+        ));
+        assert!(result
+            .get_reusable_pin_uv_auth_token(
+                &Command::BioEnrollment,
+                PinUvAuthTokenPermission::BioEnrollment,
+                false,
+                true,
+            )
+            .is_none());
+    }
+
+    #[test]
+    fn uv_token_not_reusable_when_skipping_uv() {
+        // After UV failed or got blocked, a token obtained via UV must not
+        // be reused. A token obtained via PIN is still fine.
+        let uv_result = PinUvAuthResult::SuccessGetPinUvAuthTokenUsingUvWithPermissions(token(
+            2,
+            PinUvAuthTokenPermission::BioEnrollment,
+            Command::BioEnrollment,
+        ));
+        assert!(uv_result
+            .get_reusable_pin_uv_auth_token(
+                &Command::BioEnrollment,
+                PinUvAuthTokenPermission::BioEnrollment,
+                true,
+                true,
+            )
+            .is_none());
+        let pin_result = PinUvAuthResult::SuccessGetPinUvAuthTokenUsingPinWithPermissions(token(
+            2,
+            PinUvAuthTokenPermission::BioEnrollment,
+            Command::BioEnrollment,
+        ));
+        assert!(pin_result
+            .get_reusable_pin_uv_auth_token(
+                &Command::BioEnrollment,
+                PinUvAuthTokenPermission::BioEnrollment,
+                true,
+                true,
+            )
+            .is_some());
+    }
+
+    #[test]
+    fn ctap20_pin_token_only_reusable_without_permission_system() {
+        let result = PinUvAuthResult::SuccessGetPinToken(token(
+            1,
+            PinUvAuthTokenPermission::default(),
+            Command::MakeCredentials,
+        ));
+        // CTAP2.0 tokens have no permissions and are not command-bound, so
+        // they can be reused for any command if the device has no permission
+        // system ...
+        assert!(result
+            .get_reusable_pin_uv_auth_token(
+                &Command::BioEnrollment,
+                PinUvAuthTokenPermission::BioEnrollment,
+                false,
+                false,
+            )
+            .is_some());
+        // ... but not on CTAP2.1 devices, where the default mc|ga
+        // permissions are insufficient for other commands.
+        assert!(result
+            .get_reusable_pin_uv_auth_token(
+                &Command::BioEnrollment,
+                PinUvAuthTokenPermission::BioEnrollment,
+                false,
+                true,
+            )
+            .is_none());
+    }
+
+    #[test]
+    fn untagged_token_not_reusable() {
+        // Tokens that are not bound to a command must not be reused.
+        let result = PinUvAuthResult::SuccessGetPinUvAuthTokenUsingPinWithPermissions(
+            PinUvAuthToken::create_test(1, PinUvAuthTokenPermission::BioEnrollment, None),
+        );
+        assert!(result
+            .get_reusable_pin_uv_auth_token(
+                &Command::BioEnrollment,
+                PinUvAuthTokenPermission::BioEnrollment,
+                false,
+                true,
+            )
+            .is_none());
+    }
+
+    #[test]
+    fn non_token_results_not_reusable() {
+        for result in [
+            PinUvAuthResult::RequestIsCtap1,
+            PinUvAuthResult::DeviceIsCtap1,
+            PinUvAuthResult::NoAuthTypeSupported,
+            PinUvAuthResult::NoAuthRequired,
+            PinUvAuthResult::UsingInternalUv,
+        ] {
+            assert!(result
+                .get_reusable_pin_uv_auth_token(
+                    &Command::BioEnrollment,
+                    PinUvAuthTokenPermission::BioEnrollment,
+                    false,
+                    false,
+                )
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn permissions_ignored_without_permission_system() {
+        // On CTAP2.0 / 2.1-preview devices there is no permission system,
+        // only the command-binding is enforced.
+        let result = PinUvAuthResult::SuccessGetPinUvAuthTokenUsingPinWithPermissions(token(
+            1,
+            PinUvAuthTokenPermission::empty(),
+            Command::BioEnrollmentPreview,
+        ));
+        assert!(result
+            .get_reusable_pin_uv_auth_token(
+                &Command::BioEnrollmentPreview,
+                PinUvAuthTokenPermission::BioEnrollment,
+                false,
+                false,
+            )
+            .is_some());
+        assert!(result
+            .get_reusable_pin_uv_auth_token(
+                &Command::CredentialManagementPreview,
+                PinUvAuthTokenPermission::CredentialManagement,
+                false,
+                false,
+            )
+            .is_none());
+    }
 }
