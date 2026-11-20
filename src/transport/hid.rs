@@ -107,6 +107,14 @@ pub trait HIDDevice: FidoDevice + Read + Write {
                     cmd,
                     data
                 );
+                // A cancellation can race with the authenticator's final response:
+                // the transaction may already have been cancelled while this frame was
+                // in flight. Re-check the liveness predicate before handing the response
+                // back, so that a late success answer from an aborted command can never
+                // be committed. The caller still has to honour the returned error.
+                if !keep_alive() {
+                    break;
+                }
                 return Ok((cmd, data));
             }
             // The authenticator might send us HIDCmd::Keepalive messages indefinitely, e.g. if
@@ -315,5 +323,72 @@ impl<T: HIDDevice + TestDevice> FidoDeviceIO for T {
             StatusCode::KeepaliveCancel,
             None,
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::consts::Capability;
+    use crate::transport::device_selector::Device;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    // Frame layout shared with the other transport tests:
+    //   [cid(4)] [cmd] [bcnt hi] [bcnt lo] [payload..]
+    fn init_frame(cid: &[u8; 4], cmd: HIDCmd, payload: &[u8]) -> Vec<u8> {
+        let mut frame = cid.to_vec();
+        frame.push(cmd.into());
+        frame.push(0x00);
+        frame.push(payload.len() as u8);
+        frame.extend_from_slice(payload);
+        frame
+    }
+
+    #[test]
+    fn sendrecv_returns_late_success_while_alive() {
+        // Baseline: a normal final response is delivered unchanged when the
+        // transaction is still active.
+        let mut device =
+            Device::new_pre_inited("hid/sendrecv-ok", Capability::CBOR | Capability::NMSG);
+        let cid = *device.get_cid();
+
+        let request = init_frame(&cid, HIDCmd::Ping, &[0xAA]);
+        device.add_write(&request, 0);
+        device.add_read(&init_frame(&cid, HIDCmd::Ping, &[0xAA]), 0);
+
+        let (cmd, data) = device
+            .sendrecv(HIDCmd::Ping, &[0xAA], &|| true)
+            .expect("active transaction should receive the response");
+        assert_eq!(cmd, HIDCmd::Ping);
+        assert_eq!(data, vec![0xAA]);
+    }
+
+    #[test]
+    fn sendrecv_drops_late_success_after_cancel() {
+        // Cancellation race: a successful final frame arrives after keep_alive
+        // turned false. It must not be returned; instead a CTAPHID_CANCEL is
+        // issued and the authenticator's KEEPALIVE_CANCEL answer is propagated.
+        let mut device =
+            Device::new_pre_inited("hid/sendrecv-cancel", Capability::CBOR | Capability::NMSG);
+        let cid = *device.get_cid();
+
+        let request = init_frame(&cid, HIDCmd::Cbor, &[0x01]);
+        device.add_write(&request, 0);
+        // Late successful CBOR response racing the cancellation.
+        device.add_read(&init_frame(&cid, HIDCmd::Cbor, &[0x00]), 0);
+        // Expected CTAPHID_CANCEL write (empty payload) sent to the token.
+        device.add_write(&init_frame(&cid, HIDCmd::Cancel, &[]), 0);
+        // Authenticator acknowledges with CTAP2_ERR_KEEPALIVE_CANCEL (0x2D).
+        device.add_read(&init_frame(&cid, HIDCmd::Cbor, &[0x2D]), 0);
+
+        let alive = Arc::new(AtomicBool::new(false));
+        let keep_alive = || alive.load(Ordering::SeqCst);
+        let (cmd, data) = device
+            .sendrecv(HIDCmd::Cbor, &[0x01], &keep_alive)
+            .expect("cancellation must resolve into a keepalive-cancel answer");
+
+        assert_eq!(cmd, HIDCmd::Cbor);
+        assert_eq!(data, vec![0x2D]);
     }
 }
