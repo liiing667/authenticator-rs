@@ -24,7 +24,7 @@ use crate::ctap2::commands::client_pin::{
 };
 use crate::ctap2::commands::credential_management::{
     CredManagementCommand, CredentialList, CredentialListEntry, CredentialManagement,
-    CredentialManagementResult, CredentialRpListEntry,
+    CredentialManagementResponse, CredentialManagementResult, CredentialRpListEntry,
 };
 use crate::ctap2::commands::get_assertion::{GetAssertion, GetAssertionOptions};
 use crate::ctap2::commands::make_credentials::{
@@ -40,7 +40,8 @@ use crate::ctap2::preflight::{
     silently_discover_credentials,
 };
 use crate::ctap2::server::{
-    CredentialProtectionPolicy, RelyingParty, ResidentKeyRequirement, UserVerificationRequirement,
+    CredentialProtectionPolicy, RelyingParty, ResidentKeyRequirement, RpIdHash,
+    UserVerificationRequirement,
 };
 use crate::errors::{AuthenticatorError, UnsupportedOption};
 use crate::statecallback::StateCallback;
@@ -604,6 +605,531 @@ pub fn register<Dev: FidoDevice>(
         }
     }
     false
+}
+
+#[cfg(test)]
+mod credential_management_tests {
+    use super::*;
+    use crate::crypto::{COSEAlgorithm, COSEEC2Key, COSEKey, COSEKeyType, Curve};
+    use crate::ctap2::commands::credential_management::CredentialManagementResponse;
+    use crate::ctap2::commands::{CommandError, StatusCode};
+    use crate::ctap2::server::{
+        PublicKeyCredentialDescriptor, PublicKeyCredentialUserEntity, RelyingParty, Transport,
+    };
+    use crate::status_update::StatusUpdate;
+    use crate::transport::device_selector::tests::make_device_with_pin;
+    use crate::transport::platform::device::Device;
+    use std::sync::mpsc::channel;
+
+    fn rp(id: &str) -> RelyingParty {
+        RelyingParty::from(id)
+    }
+
+    fn credential_id(byte: u8) -> PublicKeyCredentialDescriptor {
+        PublicKeyCredentialDescriptor {
+            id: vec![byte],
+            transports: vec![Transport::USB],
+        }
+    }
+
+    fn user(byte: u8) -> PublicKeyCredentialUserEntity {
+        PublicKeyCredentialUserEntity {
+            id: vec![byte],
+            name: Some(format!("user-{byte}")),
+            display_name: Some(format!("User {byte}")),
+        }
+    }
+
+    fn public_key() -> COSEKey {
+        COSEKey {
+            alg: COSEAlgorithm::ES256,
+            key: COSEKeyType::EC2(COSEEC2Key {
+                curve: Curve::SECP256R1,
+                x: vec![1u8; 32],
+                y: vec![2u8; 32],
+            }),
+        }
+    }
+
+    fn credential_entry(byte: u8) -> CredentialListEntry {
+        CredentialListEntry {
+            user: user(byte),
+            credential_id: credential_id(byte),
+            public_key: public_key(),
+            cred_protect: 1,
+            large_blob_key: None,
+        }
+    }
+
+    fn metadata_response() -> CredentialManagementResponse {
+        CredentialManagementResponse {
+            existing_resident_credentials_count: Some(1),
+            max_possible_remaining_resident_credentials_count: Some(10),
+            ..Default::default()
+        }
+    }
+
+    fn rp_page(
+        relying_party: &RelyingParty,
+        total_rps: Option<u64>,
+    ) -> CredentialManagementResponse {
+        CredentialManagementResponse {
+            rp: Some(relying_party.clone()),
+            rp_id_hash: Some(relying_party.hash()),
+            total_rps,
+            ..Default::default()
+        }
+    }
+
+    fn empty_rp_page() -> CredentialManagementResponse {
+        CredentialManagementResponse::default()
+    }
+
+    fn credential_page(
+        relying_party: &RelyingParty,
+        byte: u8,
+        total_credentials: Option<u64>,
+    ) -> CredentialManagementResponse {
+        CredentialManagementResponse {
+            rp_id_hash: Some(relying_party.hash()),
+            user: Some(user(byte)),
+            credential_id: Some(credential_id(byte)),
+            public_key: Some(public_key()),
+            cred_protect: Some(1),
+            total_credentials,
+            ..Default::default()
+        }
+    }
+
+    fn empty_credential_page(relying_party: &RelyingParty) -> CredentialManagementResponse {
+        CredentialManagementResponse {
+            rp_id_hash: Some(relying_party.hash()),
+            ..Default::default()
+        }
+    }
+
+    fn not_allowed() -> HIDError {
+        HIDError::Command(CommandError::StatusCode(StatusCode::NotAllowed, None))
+    }
+
+    fn expect_request(dev: &mut Device, subcommand: CredManagementCommand) {
+        dev.add_upcoming_ctap2_request(&CredentialManagement::new(subcommand, false));
+    }
+
+    fn test_device() -> Device {
+        let mut dev = Device::new_skipping_serialization("credential-management").unwrap();
+        make_device_with_pin(&mut dev);
+        let info = dev.get_authenticator_info().unwrap().clone();
+        dev.set_authenticator_info(crate::ctap2::commands::get_info::AuthenticatorInfo {
+            options: crate::ctap2::commands::get_info::AuthenticatorOptions {
+                cred_mgmt: Some(true),
+                // No PIN/UV protection: credential management then needs no
+                // pinUvAuthToken, which the dummy crypto backend cannot derive.
+                client_pin: None,
+                user_verification: None,
+                ..info.options
+            },
+            ..info
+        });
+        dev
+    }
+
+    /// Runs an enumeration against the scripted mock device. The enumeration
+    /// reports its result (or an error) through the status channel, while the
+    /// callback is reserved for terminal errors.
+    fn run_enumeration(dev: &mut Device) -> Result<CredentialList, AuthenticatorError> {
+        let (tx, rx) = channel::<StatusUpdate>();
+        let (err_tx, err_rx) = channel::<crate::Result<crate::ManageResult>>();
+        let callback = StateCallback::new(Box::new(move |rv| {
+            err_tx.send(rv).expect("callback result lost");
+        }));
+
+        let iterations = std::cell::Cell::new(0u32);
+        let completed = credential_management(
+            dev,
+            None,
+            CredManagementCmd::GetCredentials,
+            tx,
+            callback,
+            &|| {
+                iterations.set(iterations.get() + 1);
+                iterations.get() < 10_000
+            },
+        );
+
+        // A terminal error is delivered through the callback.
+        if let Ok(Err(authenticator_error)) = err_rx.try_recv() {
+            return Err(authenticator_error);
+        }
+        assert!(
+            completed,
+            "credential_management did not finish within 10000 iterations"
+        );
+
+        while let Ok(update) = rx.recv_timeout(std::time::Duration::from_millis(100)) {
+            if let StatusUpdate::InteractiveManagement(
+                InteractiveUpdate::CredentialManagementUpdate((result, _puat)),
+            ) = update
+            {
+                return match result {
+                    CredentialManagementResult::CredentialList(list) => Ok(list),
+                    _ => panic!("unexpected management result"),
+                };
+            }
+        }
+        panic!("enumeration never produced a CredentialManagementUpdate");
+    }
+
+    #[test]
+    fn test_no_resident_credentials_returns_empty_list() {
+        let mut dev = test_device();
+        let mut metadata = metadata_response();
+        metadata.existing_resident_credentials_count = Some(0);
+        expect_request(&mut dev, CredManagementCommand::GetCredsMetadata);
+        dev.add_upcoming_ctap_response(metadata);
+
+        let list = run_enumeration(&mut dev).expect("expected success");
+        assert!(list.credential_list.is_empty());
+    }
+
+    #[test]
+    fn test_empty_first_rp_page_ends_enumeration() {
+        let mut dev = test_device();
+        expect_request(&mut dev, CredManagementCommand::GetCredsMetadata);
+        expect_request(&mut dev, CredManagementCommand::EnumerateRPsBegin);
+        // The metadata claims credentials exist, but the RP enumeration starts
+        // with an explicit empty page. That must be treated as a clean end,
+        // not as a malformed response.
+        dev.add_upcoming_ctap_response(metadata_response());
+        dev.add_upcoming_ctap_response(empty_rp_page());
+
+        let list = run_enumeration(&mut dev).expect("expected success");
+        assert!(list.credential_list.is_empty());
+    }
+
+    #[test]
+    fn test_single_page_single_rp_single_credential() {
+        let mut dev = test_device();
+        let relying_party = rp("example.org");
+        expect_request(&mut dev, CredManagementCommand::GetCredsMetadata);
+        expect_request(&mut dev, CredManagementCommand::EnumerateRPsBegin);
+        expect_request(&mut dev, CredManagementCommand::EnumerateRPsGetNextRP);
+        expect_request(
+            &mut dev,
+            CredManagementCommand::EnumerateCredentialsBegin(relying_party.hash()),
+        );
+        expect_request(
+            &mut dev,
+            CredManagementCommand::EnumerateCredentialsGetNextCredential,
+        );
+        dev.add_upcoming_ctap_response(metadata_response());
+        dev.add_upcoming_ctap_response(rp_page(&relying_party, Some(1)));
+        dev.add_upcoming_ctap_response(empty_rp_page());
+        dev.add_upcoming_ctap_response(credential_page(&relying_party, 0xAA, Some(1)));
+        dev.add_upcoming_ctap_response(empty_credential_page(&relying_party));
+
+        let list = run_enumeration(&mut dev).expect("expected success");
+        assert_eq!(list.credential_list.len(), 1);
+        let entry = &list.credential_list[0];
+        assert_eq!(entry.rp, relying_party);
+        assert_eq!(entry.credentials, vec![credential_entry(0xAA)]);
+    }
+
+    #[test]
+    fn test_rp_without_credentials_is_preserved() {
+        let mut dev = test_device();
+        let relying_party = rp("example.org");
+        expect_request(&mut dev, CredManagementCommand::GetCredsMetadata);
+        expect_request(&mut dev, CredManagementCommand::EnumerateRPsBegin);
+        expect_request(&mut dev, CredManagementCommand::EnumerateRPsGetNextRP);
+        expect_request(
+            &mut dev,
+            CredManagementCommand::EnumerateCredentialsBegin(relying_party.hash()),
+        );
+        expect_request(
+            &mut dev,
+            CredManagementCommand::EnumerateCredentialsGetNextCredential,
+        );
+        dev.add_upcoming_ctap_response(metadata_response());
+        dev.add_upcoming_ctap_response(rp_page(&relying_party, Some(1)));
+        dev.add_upcoming_ctap_response(empty_rp_page());
+        // The RP has a begin response with zero credentials, then an explicit end.
+        let begin = CredentialManagementResponse {
+            rp_id_hash: Some(relying_party.hash()),
+            total_credentials: Some(0),
+            ..Default::default()
+        };
+        dev.add_upcoming_ctap_response(begin);
+        dev.add_upcoming_ctap_response(empty_credential_page(&relying_party));
+
+        let list = run_enumeration(&mut dev).expect("expected success");
+        assert_eq!(list.credential_list.len(), 1);
+        assert!(list.credential_list[0].credentials.is_empty());
+    }
+
+    #[test]
+    fn test_legitimate_multi_page_enumeration() {
+        let mut dev = test_device();
+        let rp_a = rp("a.example");
+        let rp_b = rp("b.example");
+        expect_request(&mut dev, CredManagementCommand::GetCredsMetadata);
+        expect_request(&mut dev, CredManagementCommand::EnumerateRPsBegin);
+        expect_request(&mut dev, CredManagementCommand::EnumerateRPsGetNextRP);
+        expect_request(&mut dev, CredManagementCommand::EnumerateRPsGetNextRP);
+        expect_request(
+            &mut dev,
+            CredManagementCommand::EnumerateCredentialsBegin(rp_a.hash()),
+        );
+        expect_request(
+            &mut dev,
+            CredManagementCommand::EnumerateCredentialsGetNextCredential,
+        );
+        expect_request(
+            &mut dev,
+            CredManagementCommand::EnumerateCredentialsGetNextCredential,
+        );
+        expect_request(
+            &mut dev,
+            CredManagementCommand::EnumerateCredentialsBegin(rp_b.hash()),
+        );
+        expect_request(
+            &mut dev,
+            CredManagementCommand::EnumerateCredentialsGetNextCredential,
+        );
+        dev.add_upcoming_ctap_response(metadata_response());
+        // Two RPs spread across two pages.
+        dev.add_upcoming_ctap_response(rp_page(&rp_a, Some(2)));
+        dev.add_upcoming_ctap_response(rp_page(&rp_b, None));
+        dev.add_upcoming_ctap_response(empty_rp_page());
+        // RP A: two credentials across two pages.
+        dev.add_upcoming_ctap_response(credential_page(&rp_a, 0x01, Some(2)));
+        dev.add_upcoming_ctap_response(credential_page(&rp_a, 0x02, None));
+        dev.add_upcoming_ctap_response(empty_credential_page(&rp_a));
+        // RP B: one credential.
+        dev.add_upcoming_ctap_response(credential_page(&rp_b, 0x03, Some(1)));
+        dev.add_upcoming_ctap_response(empty_credential_page(&rp_b));
+
+        let list = run_enumeration(&mut dev).expect("expected success");
+        assert_eq!(list.credential_list.len(), 2);
+        assert_eq!(
+            list.credential_list[0].credentials,
+            vec![credential_entry(0x01), credential_entry(0x02)]
+        );
+        assert_eq!(
+            list.credential_list[1].credentials,
+            vec![credential_entry(0x03)]
+        );
+    }
+
+    #[test]
+    fn test_not_allowed_terminates_rp_and_credential_enumeration() {
+        let mut dev = test_device();
+        let relying_party = rp("example.org");
+        expect_request(&mut dev, CredManagementCommand::GetCredsMetadata);
+        expect_request(&mut dev, CredManagementCommand::EnumerateRPsBegin);
+        expect_request(&mut dev, CredManagementCommand::EnumerateRPsGetNextRP);
+        expect_request(
+            &mut dev,
+            CredManagementCommand::EnumerateCredentialsBegin(relying_party.hash()),
+        );
+        expect_request(
+            &mut dev,
+            CredManagementCommand::EnumerateCredentialsGetNextCredential,
+        );
+        dev.add_upcoming_ctap_response(metadata_response());
+        dev.add_upcoming_ctap_response(rp_page(&relying_party, Some(1)));
+        // Authenticator signals end of RP enumeration via NOT_ALLOWED.
+        dev.add_upcoming_ctap_error(not_allowed());
+        dev.add_upcoming_ctap_response(credential_page(&relying_party, 0xAA, Some(1)));
+        // End of credential enumeration via NOT_ALLOWED as well.
+        dev.add_upcoming_ctap_error(not_allowed());
+
+        let list = run_enumeration(&mut dev).expect("expected success");
+        assert_eq!(list.credential_list.len(), 1);
+        assert_eq!(
+            list.credential_list[0].credentials,
+            vec![credential_entry(0xAA)]
+        );
+    }
+
+    #[test]
+    fn test_not_allowed_advances_across_multiple_rps() {
+        let mut dev = test_device();
+        let rp_a = rp("a.example");
+        let rp_b = rp("b.example");
+        expect_request(&mut dev, CredManagementCommand::GetCredsMetadata);
+        expect_request(&mut dev, CredManagementCommand::EnumerateRPsBegin);
+        expect_request(&mut dev, CredManagementCommand::EnumerateRPsGetNextRP);
+        expect_request(&mut dev, CredManagementCommand::EnumerateRPsGetNextRP);
+        expect_request(
+            &mut dev,
+            CredManagementCommand::EnumerateCredentialsBegin(rp_a.hash()),
+        );
+        expect_request(
+            &mut dev,
+            CredManagementCommand::EnumerateCredentialsGetNextCredential,
+        );
+        expect_request(
+            &mut dev,
+            CredManagementCommand::EnumerateCredentialsBegin(rp_b.hash()),
+        );
+        expect_request(
+            &mut dev,
+            CredManagementCommand::EnumerateCredentialsGetNextCredential,
+        );
+        dev.add_upcoming_ctap_response(metadata_response());
+        dev.add_upcoming_ctap_response(rp_page(&rp_a, Some(2)));
+        dev.add_upcoming_ctap_response(rp_page(&rp_b, None));
+        // End of the RP enumeration.
+        dev.add_upcoming_ctap_error(not_allowed());
+        // RP A: one credential then NOT_ALLOWED.
+        dev.add_upcoming_ctap_response(credential_page(&rp_a, 0x01, Some(1)));
+        dev.add_upcoming_ctap_error(not_allowed());
+        // RP B: one credential then NOT_ALLOWED.
+        dev.add_upcoming_ctap_response(credential_page(&rp_b, 0x02, Some(1)));
+        dev.add_upcoming_ctap_error(not_allowed());
+
+        let list = run_enumeration(&mut dev).expect("expected success");
+        assert_eq!(list.credential_list.len(), 2);
+        assert_eq!(
+            list.credential_list[0].credentials,
+            vec![credential_entry(0x01)]
+        );
+        assert_eq!(
+            list.credential_list[1].credentials,
+            vec![credential_entry(0x02)]
+        );
+    }
+
+    #[test]
+    fn test_credential_page_switching_rp_is_rejected() {
+        let mut dev = test_device();
+        let rp_a = rp("a.example");
+        let rp_b = rp("b.example");
+        expect_request(&mut dev, CredManagementCommand::GetCredsMetadata);
+        expect_request(&mut dev, CredManagementCommand::EnumerateRPsBegin);
+        expect_request(&mut dev, CredManagementCommand::EnumerateRPsGetNextRP);
+        expect_request(
+            &mut dev,
+            CredManagementCommand::EnumerateCredentialsBegin(rp_a.hash()),
+        );
+        expect_request(
+            &mut dev,
+            CredManagementCommand::EnumerateCredentialsGetNextCredential,
+        );
+        dev.add_upcoming_ctap_response(metadata_response());
+        dev.add_upcoming_ctap_response(rp_page(&rp_a, Some(1)));
+        dev.add_upcoming_ctap_response(empty_rp_page());
+        dev.add_upcoming_ctap_response(credential_page(&rp_a, 0x01, Some(2)));
+        // A page that suddenly belongs to a different RP mid-enumeration.
+        dev.add_upcoming_ctap_response(credential_page(&rp_b, 0x02, None));
+
+        let err = run_enumeration(&mut dev).expect_err("expected RP mismatch error");
+        assert!(matches!(err, AuthenticatorError::Platform));
+    }
+
+    #[test]
+    fn test_duplicate_credential_handle_is_rejected() {
+        let mut dev = test_device();
+        let relying_party = rp("example.org");
+        expect_request(&mut dev, CredManagementCommand::GetCredsMetadata);
+        expect_request(&mut dev, CredManagementCommand::EnumerateRPsBegin);
+        expect_request(&mut dev, CredManagementCommand::EnumerateRPsGetNextRP);
+        expect_request(
+            &mut dev,
+            CredManagementCommand::EnumerateCredentialsBegin(relying_party.hash()),
+        );
+        expect_request(
+            &mut dev,
+            CredManagementCommand::EnumerateCredentialsGetNextCredential,
+        );
+        dev.add_upcoming_ctap_response(metadata_response());
+        dev.add_upcoming_ctap_response(rp_page(&relying_party, Some(1)));
+        dev.add_upcoming_ctap_response(empty_rp_page());
+        dev.add_upcoming_ctap_response(credential_page(&relying_party, 0x01, Some(2)));
+        // Same credential handle repeated on the next page.
+        dev.add_upcoming_ctap_response(credential_page(&relying_party, 0x01, None));
+
+        let err = run_enumeration(&mut dev).expect_err("expected duplicate handle error");
+        assert!(matches!(err, AuthenticatorError::Platform));
+    }
+
+    #[test]
+    fn test_duplicate_rp_is_rejected() {
+        let mut dev = test_device();
+        let relying_party = rp("example.org");
+        expect_request(&mut dev, CredManagementCommand::GetCredsMetadata);
+        expect_request(&mut dev, CredManagementCommand::EnumerateRPsBegin);
+        expect_request(&mut dev, CredManagementCommand::EnumerateRPsGetNextRP);
+        dev.add_upcoming_ctap_response(metadata_response());
+        dev.add_upcoming_ctap_response(rp_page(&relying_party, Some(2)));
+        // The authenticator repeats the same RP instead of advancing.
+        dev.add_upcoming_ctap_response(rp_page(&relying_party, None));
+
+        let err = run_enumeration(&mut dev).expect_err("expected duplicate RP error");
+        assert!(matches!(err, AuthenticatorError::Platform));
+    }
+
+    #[test]
+    fn test_truncated_rp_enumeration_keeps_collected_set() {
+        let mut dev = test_device();
+        let rp_a = rp("a.example");
+        let rp_b = rp("b.example");
+        // The authenticator announces two RPs but only ever returns one before
+        // signalling the end of the enumeration. The collected RP is retained.
+        expect_request(&mut dev, CredManagementCommand::GetCredsMetadata);
+        expect_request(&mut dev, CredManagementCommand::EnumerateRPsBegin);
+        expect_request(&mut dev, CredManagementCommand::EnumerateRPsGetNextRP);
+        expect_request(
+            &mut dev,
+            CredManagementCommand::EnumerateCredentialsBegin(rp_a.hash()),
+        );
+        expect_request(
+            &mut dev,
+            CredManagementCommand::EnumerateCredentialsGetNextCredential,
+        );
+        dev.add_upcoming_ctap_response(metadata_response());
+        dev.add_upcoming_ctap_response(rp_page(&rp_a, Some(2)));
+        dev.add_upcoming_ctap_response(empty_rp_page());
+        dev.add_upcoming_ctap_response(credential_page(&rp_a, 0x01, Some(1)));
+        dev.add_upcoming_ctap_response(empty_credential_page(&rp_a));
+
+        let list = run_enumeration(&mut dev).expect("expected success");
+        assert_eq!(list.credential_list.len(), 1);
+        assert_eq!(list.credential_list[0].rp, rp_a);
+        assert_eq!(
+            list.credential_list[0].credentials,
+            vec![credential_entry(0x01)]
+        );
+        // rp_b was never delivered, so it must not appear.
+        assert!(list.credential_list.iter().all(|entry| entry.rp != rp_b));
+    }
+
+    #[test]
+    fn test_more_credential_pages_than_announced_is_rejected() {
+        let mut dev = test_device();
+        let relying_party = rp("example.org");
+        expect_request(&mut dev, CredManagementCommand::GetCredsMetadata);
+        expect_request(&mut dev, CredManagementCommand::EnumerateRPsBegin);
+        expect_request(&mut dev, CredManagementCommand::EnumerateRPsGetNextRP);
+        expect_request(
+            &mut dev,
+            CredManagementCommand::EnumerateCredentialsBegin(relying_party.hash()),
+        );
+        expect_request(
+            &mut dev,
+            CredManagementCommand::EnumerateCredentialsGetNextCredential,
+        );
+        dev.add_upcoming_ctap_response(metadata_response());
+        dev.add_upcoming_ctap_response(rp_page(&relying_party, Some(1)));
+        dev.add_upcoming_ctap_response(empty_rp_page());
+        // Only one credential is announced, but two distinct pages are served.
+        dev.add_upcoming_ctap_response(credential_page(&relying_party, 0x01, Some(1)));
+        dev.add_upcoming_ctap_response(credential_page(&relying_party, 0x02, None));
+
+        let err = run_enumeration(&mut dev).expect_err("expected truncation error");
+        assert!(matches!(err, AuthenticatorError::Platform));
+    }
 }
 
 /// Check that the signing request can be processed by a CTAP1 device.
@@ -1202,6 +1728,207 @@ pub(crate) fn bio_enrollment(
     false
 }
 
+/// Outcome of validating and integrating a single page returned by one of the
+/// paged credential-management enumerations.
+#[derive(Debug, PartialEq, Eq)]
+enum PageOutcome {
+    /// The page carried an entry that was accepted into the result set.
+    Accepted,
+    /// The page was empty (no entry) and therefore marks the explicit end of
+    /// the current enumeration.
+    EndOfEnumeration,
+}
+
+/// Pagination state for the `authenticatorCredentialManagement` RP
+/// enumeration (`EnumerateRPsBegin`/`EnumerateRPsGetNextRP`).
+///
+/// A page is only ever valid while an enumeration started by
+/// `EnumerateRPsBegin` is active. Starting a new enumeration (a new
+/// "generation") invalidates every page left over from the previous one.
+#[derive(Default)]
+struct RpPagination {
+    /// Whether an RP enumeration is currently in progress.
+    active: bool,
+    /// RPs still expected, derived from `totalRPs`. Used purely as a sanity
+    /// check; termination is driven by the explicit end signal instead.
+    remaining: Option<u64>,
+}
+
+impl RpPagination {
+    /// Called when an `EnumerateRPsBegin` request is about to be sent.
+    fn begin(&mut self) {
+        self.active = true;
+        self.remaining = None;
+    }
+
+    /// Validates a single RP page. A page without RP data is an explicit,
+    /// legitimate end of the enumeration. Duplicate RPs (same RP ID hash) and
+    /// pages received while no enumeration is active are rejected.
+    fn handle_page(
+        &mut self,
+        is_begin: bool,
+        result: &CredentialManagementResponse,
+        list: &mut Vec<CredentialRpListEntry>,
+    ) -> Result<PageOutcome, AuthenticatorError> {
+        // A page is only consumed while an enumeration started by `begin()` is
+        // active. Starting a new generation clears the previous one first.
+        if !self.active {
+            return Err(AuthenticatorError::Platform);
+        }
+
+        if is_begin {
+            // `totalRPs` is only present on the response to `EnumerateRPsBegin`.
+            self.remaining = result.total_rps;
+        }
+
+        // An empty page (no RP / RP ID hash) is the authenticator's explicit
+        // signal that there are no more RPs. It must not be confused with an
+        // error nor with a regular entry.
+        let rp = match &result.rp {
+            Some(rp) => rp,
+            None => {
+                self.active = false;
+                self.remaining = None;
+                return Ok(PageOutcome::EndOfEnumeration);
+            }
+        };
+        let rp_id_hash = result
+            .rp_id_hash
+            .clone()
+            .ok_or(AuthenticatorError::Platform)?;
+
+        // Every RP must be unique within one enumeration; a duplicated page
+        // (same handle/RP ID hash) must not silently truncate the result.
+        if list.iter().any(|entry| entry.rp_id_hash == rp_id_hash) {
+            return Err(AuthenticatorError::Platform);
+        }
+
+        if let Some(remaining) = self.remaining.as_mut() {
+            // The authenticator handed out more entries than it announced, or
+            // kept serving pages after the announced set was exhausted.
+            if *remaining == 0 {
+                return Err(AuthenticatorError::Platform);
+            }
+            *remaining -= 1;
+        }
+
+        list.push(CredentialRpListEntry {
+            rp: rp.clone(),
+            rp_id_hash,
+            credentials: vec![],
+        });
+        Ok(PageOutcome::Accepted)
+    }
+}
+
+/// Pagination state for the per-RP credential enumeration
+/// (`EnumerateCredentialsBegin`/`EnumerateCredentialsGetNextCredential`).
+///
+/// All pages of one credential enumeration are bound to a single RP ID hash
+/// while the enumeration is active. A page that switches RP mid-enumeration,
+/// repeats a credential handle, or arrives outside an active enumeration is
+/// invalid.
+#[derive(Default)]
+struct CredentialPagination {
+    /// Whether a per-RP credential enumeration is currently in progress.
+    active: bool,
+    /// RP the running enumeration is bound to.
+    rp_id_hash: Option<RpIdHash>,
+    /// Credentials still expected, derived from `totalCredentials`. Used as a
+    /// sanity check only; termination is driven by the explicit end signal.
+    remaining: Option<u64>,
+}
+
+impl CredentialPagination {
+    /// Called when an `EnumerateCredentialsBegin` request for `rp_id_hash` is
+    /// about to be sent.
+    fn begin(&mut self, rp_id_hash: RpIdHash) {
+        self.active = true;
+        self.rp_id_hash = Some(rp_id_hash);
+        self.remaining = None;
+    }
+
+    /// Validates a single credential page and, on success, appends the entry to
+    /// `credentials`. A page without credential data is the explicit end of the
+    /// enumeration for the bound RP.
+    fn handle_page(
+        &mut self,
+        is_begin: bool,
+        result: &CredentialManagementResponse,
+        credentials: &mut Vec<CredentialListEntry>,
+    ) -> Result<PageOutcome, AuthenticatorError> {
+        // Pages are only consumed while an enumeration started by `begin()` is
+        // active and bound to a specific RP.
+        if !self.active {
+            return Err(AuthenticatorError::Platform);
+        }
+        let bound_rp = self
+            .rp_id_hash
+            .clone()
+            .ok_or(AuthenticatorError::Platform)?;
+
+        if is_begin {
+            // `totalCredentials` is only present on the Begin response.
+            self.remaining = Some(
+                result
+                    .total_credentials
+                    .ok_or(AuthenticatorError::Platform)?,
+            );
+        }
+
+        // Every page has to stay bound to the same RP. A page that switches RP
+        // halfway through the enumeration is invalid.
+        if let Some(page_rp) = &result.rp_id_hash {
+            if page_rp != &bound_rp {
+                return Err(AuthenticatorError::Platform);
+            }
+        }
+
+        let credential_id = match &result.credential_id {
+            Some(credential_id) => credential_id,
+            None => {
+                // Empty page: explicit, legitimate end of this RP's
+                // enumeration.
+                self.active = false;
+                self.rp_id_hash = None;
+                self.remaining = None;
+                return Ok(PageOutcome::EndOfEnumeration);
+            }
+        };
+
+        // A repeated credential handle within the same enumeration indicates a
+        // duplicated page and must not be folded into the set silently.
+        if credentials
+            .iter()
+            .any(|entry| &entry.credential_id == credential_id)
+        {
+            return Err(AuthenticatorError::Platform);
+        }
+
+        if let Some(remaining) = self.remaining.as_mut() {
+            if *remaining == 0 {
+                return Err(AuthenticatorError::Platform);
+            }
+            *remaining -= 1;
+        }
+
+        let user = result.user.clone().ok_or(AuthenticatorError::Platform)?;
+        let public_key = result
+            .public_key
+            .clone()
+            .ok_or(AuthenticatorError::Platform)?;
+        let cred_protect = result.cred_protect.ok_or(AuthenticatorError::Platform)?;
+        credentials.push(CredentialListEntry {
+            user,
+            credential_id: credential_id.clone(),
+            public_key,
+            cred_protect,
+            large_blob_key: result.large_blob_key.clone(),
+        });
+        Ok(PageOutcome::Accepted)
+    }
+}
+
 pub fn credential_management<Dev: FidoDevice>(
     dev: &mut Dev,
     puat_result: Option<PinUvAuthResult>,
@@ -1256,9 +1983,12 @@ pub fn credential_management<Dev: FidoDevice>(
         ),
     };
     let mut credential_result = CredentialList::new();
-    let mut remaining_rps = 0;
-    let mut remaining_cred_ids = 0;
-    let mut current_rp = 0;
+    // State for the two paged enumerations (RPs and per-RP credentials).
+    // Every page of an enumeration is bound to the same session ("generation")
+    // and, for credentials, to the same RP until the authenticator signals an
+    // explicit end of the enumeration.
+    let mut rp_pagination = RpPagination::default();
+    let mut credential_pagination = CredentialPagination::default();
     let mut skip_puap = false;
     let mut cached_puat = false; // If we were provided with a cached puat from the outside
     let mut pin_uv_auth_result = puat_result
@@ -1319,6 +2049,7 @@ pub fn credential_management<Dev: FidoDevice>(
                         credential_result.max_possible_remaining_resident_credentials_count =
                             max_possible_remaining_resident_credentials_count;
                         if existing_resident_credentials_count > 0 {
+                            rp_pagination.begin();
                             cred_management.subcommand = CredManagementCommand::EnumerateRPsBegin;
                             // We have to regenerate PUAP here. PUAT hasn't changed, but the content
                             // of the command has changed, and that is part of the PUAP-calculation
@@ -1348,49 +2079,53 @@ pub fn credential_management<Dev: FidoDevice>(
                     }
                     CredManagementCommand::EnumerateRPsBegin
                     | CredManagementCommand::EnumerateRPsGetNextRP => {
-                        if matches!(
+                        let is_begin = matches!(
                             cred_management.subcommand,
                             CredManagementCommand::EnumerateRPsBegin
+                        );
+                        let page = match rp_pagination.handle_page(
+                            is_begin,
+                            &result,
+                            &mut credential_result.credential_list,
                         ) {
-                            let total_rps = unwrap_option!(result.total_rps, callback);
-                            if total_rps == 0 {
-                                // This token doesn't have any RPs, but its not an error,
-                                // so we return an Ok with an empty list.
-                                send_status(
-                                    &status,
-                                    StatusUpdate::InteractiveManagement(
-                                        InteractiveUpdate::CredentialManagementUpdate((
-                                            CredentialManagementResult::CredentialList(
-                                                credential_result,
-                                            ),
-                                            Some(pin_uv_auth_result),
-                                        )),
-                                    ),
-                                );
-                                return true;
+                            Ok(page) => page,
+                            Err(e) => {
+                                callback.call(Err(e));
+                                return false;
                             }
-                            remaining_rps = total_rps - 1;
-                        } else {
-                            remaining_rps -= 1;
-                        }
-
-                        let rp = unwrap_option!(result.rp, callback);
-                        let rp_id_hash = unwrap_option!(result.rp_id_hash, callback);
-                        let rp_res = CredentialRpListEntry {
-                            rp,
-                            rp_id_hash,
-                            credentials: vec![],
                         };
-                        credential_result.credential_list.push(rp_res);
-                        if remaining_rps > 0 {
-                            cred_management.subcommand =
-                                CredManagementCommand::EnumerateRPsGetNextRP;
-                        } else {
-                            // We have queried all RPs, now start querying the corresponding credentials for each RP
-                            cred_management.subcommand =
-                                CredManagementCommand::EnumerateCredentialsBegin(
-                                    credential_result.credential_list[0].rp_id_hash.clone(),
-                                );
+
+                        match page {
+                            PageOutcome::Accepted => {
+                                // Keep paging within the same enumeration/generation.
+                                cred_management.subcommand =
+                                    CredManagementCommand::EnumerateRPsGetNextRP;
+                            }
+                            PageOutcome::EndOfEnumeration => {
+                                // Explicit end of the RP enumeration. If the
+                                // authenticator reported no RPs, return an empty
+                                // list; otherwise start enumerating the
+                                // credentials of the first RP.
+                                if credential_result.credential_list.is_empty() {
+                                    send_status(
+                                        &status,
+                                        StatusUpdate::InteractiveManagement(
+                                            InteractiveUpdate::CredentialManagementUpdate((
+                                                CredentialManagementResult::CredentialList(
+                                                    credential_result,
+                                                ),
+                                                Some(pin_uv_auth_result),
+                                            )),
+                                        ),
+                                    );
+                                    return true;
+                                }
+                                let first_rp =
+                                    credential_result.credential_list[0].rp_id_hash.clone();
+                                credential_pagination.begin(first_rp.clone());
+                                cred_management.subcommand =
+                                    CredManagementCommand::EnumerateCredentialsBegin(first_rp);
+                            }
                         }
                         // We have to regenerate PUAP here. PUAT hasn't changed, but the content
                         // of the command has changed, and that is part of the PUAP-calculation
@@ -1403,76 +2138,86 @@ pub fn credential_management<Dev: FidoDevice>(
                     }
                     CredManagementCommand::EnumerateCredentialsBegin(..)
                     | CredManagementCommand::EnumerateCredentialsGetNextCredential => {
-                        let user = unwrap_option!(result.user, callback);
-                        let credential_id = unwrap_option!(result.credential_id, callback);
-                        let public_key = unwrap_option!(result.public_key, callback);
-                        let cred_protect = unwrap_option!(result.cred_protect, callback);
-                        let large_blob_key = result.large_blob_key;
-
-                        if matches!(
+                        let is_begin = matches!(
                             cred_management.subcommand,
                             CredManagementCommand::EnumerateCredentialsBegin(..)
-                        ) {
-                            remaining_cred_ids =
-                                unwrap_option!(result.total_credentials, callback) - 1;
-                        } else {
-                            remaining_cred_ids -= 1;
-                        }
-                        // We might have to change the global variable, but need the unmodified below
-                        let current_rp_backup = current_rp;
-                        let mut we_are_done = false;
-                        if remaining_cred_ids > 0 {
-                            cred_management.subcommand =
-                                CredManagementCommand::EnumerateCredentialsGetNextCredential;
-                        } else {
-                            current_rp += 1;
-                            // We have all credentials from this RP. Starting with the next RP.
-                            if current_rp < credential_result.credential_list.len() {
+                        );
+                        // Credentials of the RP this enumeration is bound to.
+                        let bound_rp = match credential_pagination.rp_id_hash.clone() {
+                            Some(rp_id_hash) => rp_id_hash,
+                            None => {
+                                callback.call(Err(AuthenticatorError::Platform));
+                                return false;
+                            }
+                        };
+                        let rp_index = match credential_result
+                            .credential_list
+                            .iter()
+                            .position(|entry| entry.rp_id_hash == bound_rp)
+                        {
+                            Some(index) => index,
+                            None => {
+                                callback.call(Err(AuthenticatorError::Platform));
+                                return false;
+                            }
+                        };
+
+                        let page = {
+                            let credentials =
+                                &mut credential_result.credential_list[rp_index].credentials;
+                            match credential_pagination.handle_page(is_begin, &result, credentials)
+                            {
+                                Ok(page) => page,
+                                Err(e) => {
+                                    callback.call(Err(e));
+                                    return false;
+                                }
+                            }
+                        };
+
+                        match page {
+                            PageOutcome::Accepted => {
+                                // Stay within the same RP/generation and fetch
+                                // the next credential.
                                 cred_management.subcommand =
-                                    CredManagementCommand::EnumerateCredentialsBegin(
-                                        credential_result.credential_list[current_rp]
-                                            .rp_id_hash
-                                            .clone(),
+                                    CredManagementCommand::EnumerateCredentialsGetNextCredential;
+                            }
+                            PageOutcome::EndOfEnumeration => {
+                                // This RP is fully enumerated. Move on to the
+                                // next RP, or finish.
+                                let next_rp_index = rp_index + 1;
+                                if next_rp_index < credential_result.credential_list.len() {
+                                    let next_rp = credential_result.credential_list[next_rp_index]
+                                        .rp_id_hash
+                                        .clone();
+                                    credential_pagination.begin(next_rp.clone());
+                                    cred_management.subcommand =
+                                        CredManagementCommand::EnumerateCredentialsBegin(next_rp);
+                                } else {
+                                    // Finally done iterating over all RPs and their credentials.
+                                    send_status(
+                                        &status,
+                                        StatusUpdate::InteractiveManagement(
+                                            InteractiveUpdate::CredentialManagementUpdate((
+                                                CredentialManagementResult::CredentialList(
+                                                    credential_result,
+                                                ),
+                                                Some(pin_uv_auth_result),
+                                            )),
+                                        ),
                                     );
-                                // We have to regenerate PUAP here. PUAT hasn't changed, but the content
-                                // of the command has changed, and that is part of the PUAP-calculation
-                                unwrap_result!(
-                                    cred_management.set_pin_uv_auth_param(
-                                        pin_uv_auth_result.get_pin_uv_auth_token()
-                                    ),
-                                    callback
-                                );
-                            } else {
-                                // Finally done iterating over all RPs and their Credentials
-                                we_are_done = true;
+                                    return true;
+                                }
                             }
                         }
-                        let key = CredentialListEntry {
-                            user,
-                            credential_id,
-                            public_key,
-                            cred_protect,
-                            large_blob_key,
-                        };
-                        credential_result.credential_list[current_rp_backup]
-                            .credentials
-                            .push(key);
-                        if we_are_done {
-                            send_status(
-                                &status,
-                                StatusUpdate::InteractiveManagement(
-                                    InteractiveUpdate::CredentialManagementUpdate((
-                                        CredentialManagementResult::CredentialList(
-                                            credential_result,
-                                        ),
-                                        Some(pin_uv_auth_result),
-                                    )),
-                                ),
-                            );
-                            return true;
-                        } else {
-                            continue;
-                        }
+                        // We have to regenerate PUAP here. PUAT hasn't changed, but the content
+                        // of the command has changed, and that is part of the PUAP-calculation
+                        unwrap_result!(
+                            cred_management
+                                .set_pin_uv_auth_param(pin_uv_auth_result.get_pin_uv_auth_token()),
+                            callback
+                        );
+                        continue;
                     }
                     CredManagementCommand::DeleteCredential(_) => {
                         send_status(
@@ -1501,6 +2246,102 @@ pub fn credential_management<Dev: FidoDevice>(
                 };
             }
             Err(e) => {
+                // The CTAP spec uses `NOT_ALLOWED` as the explicit terminator
+                // for the paged enumerations: it means "there are no more
+                // entries". Treat it like an empty page instead of surfacing it
+                // as an error, but only while an enumeration is actually running.
+                if let HIDError::Command(CommandError::StatusCode(StatusCode::NotAllowed, _)) = &e {
+                    match cred_management.subcommand {
+                        CredManagementCommand::EnumerateRPsBegin
+                        | CredManagementCommand::EnumerateRPsGetNextRP => {
+                            rp_pagination.active = false;
+                            rp_pagination.remaining = None;
+                            if credential_result.credential_list.is_empty() {
+                                // No RPs at all: return an empty list.
+                                send_status(
+                                    &status,
+                                    StatusUpdate::InteractiveManagement(
+                                        InteractiveUpdate::CredentialManagementUpdate((
+                                            CredentialManagementResult::CredentialList(
+                                                credential_result,
+                                            ),
+                                            Some(pin_uv_auth_result),
+                                        )),
+                                    ),
+                                );
+                                return true;
+                            }
+                            // RP enumeration ended: start enumerating the
+                            // credentials of the first RP.
+                            let first_rp = credential_result.credential_list[0].rp_id_hash.clone();
+                            credential_pagination.begin(first_rp.clone());
+                            cred_management.subcommand =
+                                CredManagementCommand::EnumerateCredentialsBegin(first_rp);
+                            unwrap_result!(
+                                cred_management.set_pin_uv_auth_param(
+                                    pin_uv_auth_result.get_pin_uv_auth_token()
+                                ),
+                                callback
+                            );
+                            continue;
+                        }
+                        CredManagementCommand::EnumerateCredentialsBegin(..)
+                        | CredManagementCommand::EnumerateCredentialsGetNextCredential => {
+                            // This RP's credential enumeration ended. Advance to
+                            // the next RP, or finish when all RPs are done.
+                            let current_index = match credential_pagination.rp_id_hash.clone() {
+                                Some(bound_rp) => match credential_result
+                                    .credential_list
+                                    .iter()
+                                    .position(|entry| entry.rp_id_hash == bound_rp)
+                                {
+                                    Some(index) => index,
+                                    None => {
+                                        callback.call(Err(AuthenticatorError::Platform));
+                                        return false;
+                                    }
+                                },
+                                None => {
+                                    callback.call(Err(AuthenticatorError::Platform));
+                                    return false;
+                                }
+                            };
+
+                            credential_pagination.active = false;
+                            credential_pagination.rp_id_hash = None;
+                            credential_pagination.remaining = None;
+                            let next_index = current_index + 1;
+                            if next_index < credential_result.credential_list.len() {
+                                let next_rp = credential_result.credential_list[next_index]
+                                    .rp_id_hash
+                                    .clone();
+                                credential_pagination.begin(next_rp.clone());
+                                cred_management.subcommand =
+                                    CredManagementCommand::EnumerateCredentialsBegin(next_rp);
+                                unwrap_result!(
+                                    cred_management.set_pin_uv_auth_param(
+                                        pin_uv_auth_result.get_pin_uv_auth_token()
+                                    ),
+                                    callback
+                                );
+                                continue;
+                            }
+                            send_status(
+                                &status,
+                                StatusUpdate::InteractiveManagement(
+                                    InteractiveUpdate::CredentialManagementUpdate((
+                                        CredentialManagementResult::CredentialList(
+                                            credential_result,
+                                        ),
+                                        Some(pin_uv_auth_result),
+                                    )),
+                                ),
+                            );
+                            return true;
+                        }
+                        _ => {}
+                    }
+                }
                 handle_errors!(
                     e,
                     status,
