@@ -289,6 +289,11 @@ impl<'de> Deserialize<'de> for AuthenticatorData {
             where
                 E: SerdeError,
             {
+                // Parse every section declared by the flags inside a single transaction. Any
+                // failure short-circuits with `?`, so a truncated or contradictory input never
+                // yields a partially populated AuthenticatorData. Only when every declared
+                // section has been parsed and the whole buffer has been consumed do we hand back
+                // a value.
                 let mut cursor = Cursor::new(input);
                 let mut rp_id_hash_raw = [0u8; 32];
                 cursor
@@ -299,10 +304,12 @@ impl<'de> Deserialize<'de> for AuthenticatorData {
                 // preserve the flags, even if some reserved values are set.
                 let flags = AuthenticatorDataFlags::from_bits_truncate(read_byte(&mut cursor)?);
                 let counter = read_be_u32(&mut cursor)?;
-                let mut credential_data = None;
-                if flags.contains(AuthenticatorDataFlags::ATTESTED) {
-                    credential_data = Some(parse_attested_cred_data(&mut cursor)?);
-                }
+
+                let credential_data = if flags.contains(AuthenticatorDataFlags::ATTESTED) {
+                    Some(parse_attested_cred_data(&mut cursor)?)
+                } else {
+                    None
+                };
 
                 let extensions = if flags.contains(AuthenticatorDataFlags::EXTENSION_DATA) {
                     from_slice_stream(&mut cursor)?
@@ -310,8 +317,20 @@ impl<'de> Deserialize<'de> for AuthenticatorData {
                     Default::default()
                 };
 
-                // TODO(baloo): we should check for end of buffer and raise a parse
-                //              parse error if data is still in the buffer
+                // The flags may announce an attested credential and/or extension data, but the
+                // remaining length has to agree. Reject any trailing bytes so a device that sets
+                // a flag while appending unrelated or truncated data cannot smuggle a
+                // half-parsed object past us.
+                let mut remaining = Vec::new();
+                cursor
+                    .read_to_end(&mut remaining)
+                    .map_err(|_| serde_parse_err("authenticator data"))?;
+                if !remaining.is_empty() {
+                    return Err(serde_parse_err(
+                        "unexpected trailing bytes in authenticator data",
+                    ));
+                }
+
                 Ok(AuthenticatorData {
                     rp_id_hash,
                     flags,
@@ -1215,6 +1234,163 @@ pub mod test {
         let without_flag = to_vec(&parsed_auth_data).expect("could not serialize auth data");
         // The serialized auth data should be one byte shorter.
         assert!(with_flag.len() == without_flag.len() + 1);
+    }
+
+    /// Build the fixed 37-byte prefix shared by every authenticator data blob:
+    /// 32-byte rpIdHash, 1-byte flags, 4-byte signature counter.
+    fn auth_data_prefix(flags: u8) -> Vec<u8> {
+        let mut prefix = vec![0u8; 32];
+        prefix.push(flags);
+        prefix.extend_from_slice(&0u32.to_be_bytes());
+        prefix
+    }
+
+    /// Wrap a raw authenticator data byte string in a CBOR byte string so it can be
+    /// deserialized through the same path as a real response.
+    fn cbor_bytes(raw: &[u8]) -> Vec<u8> {
+        let mut wrapped = Vec::new();
+        use serde::Serializer;
+        serde_cbor::Serializer::new(&mut wrapped)
+            .serialize_bytes(raw)
+            .expect("could not wrap auth data in a CBOR byte string");
+        wrapped
+    }
+
+    /// A minimal but complete attested credential section: 16-byte AAGUID, a zero-length
+    /// credential id, and a minimal valid COSE EC2 public key.
+    fn attested_credential_section() -> Vec<u8> {
+        let mut section = vec![0u8; 16];
+        section.extend_from_slice(&0u16.to_be_bytes());
+        // Minimal valid COSE EC2 (ES256) public key:
+        // { 1: 2 (EC2), 3: -7 (ES256), -1: 1 (P-256), -2: h'', -3: h'' }
+        section.extend_from_slice(&[
+            0xA5, // map(5)
+            0x01, 0x02, // kty = EC2
+            0x03, 0x26, // alg = -7 (ES256)
+            0x20, 0x01, // crv = 1 (P-256)
+            0x21, 0x40, // x = empty bytes
+            0x22, 0x40, // y = empty bytes
+        ]);
+        section
+    }
+
+    #[test]
+    fn test_auth_data_rejects_truncated_and_contradictory_input() {
+        // Missing sections / truncation must fail rather than return a half-populated object.
+
+        // The whole blob is shorter than the fixed 37-byte prefix.
+        assert!(from_slice::<AuthenticatorData>(&cbor_bytes(&[0u8; 10])).is_err());
+
+        // ATTESTED is announced but no attested credential data follows.
+        assert!(
+            from_slice::<AuthenticatorData>(&cbor_bytes(&auth_data_prefix(
+                AuthenticatorDataFlags::ATTESTED.bits()
+            )))
+            .is_err()
+        );
+
+        // ATTESTED is announced but the AAGUID is truncated (10 of 16 bytes).
+        let mut truncated_aaguid = auth_data_prefix(AuthenticatorDataFlags::ATTESTED.bits());
+        truncated_aaguid.extend_from_slice(&[0u8; 10]);
+        assert!(from_slice::<AuthenticatorData>(&cbor_bytes(&truncated_aaguid)).is_err());
+
+        // EXTENSION_DATA is announced but no extension map follows.
+        assert!(
+            from_slice::<AuthenticatorData>(&cbor_bytes(&auth_data_prefix(
+                AuthenticatorDataFlags::EXTENSION_DATA.bits()
+            )))
+            .is_err()
+        );
+
+        // EXTENSION_DATA is announced but the map is truncated (map(1), key, missing value).
+        let mut truncated_ext = auth_data_prefix(AuthenticatorDataFlags::EXTENSION_DATA.bits());
+        truncated_ext.extend_from_slice(&[0xA1, 0x61, b'a']);
+        assert!(from_slice::<AuthenticatorData>(&cbor_bytes(&truncated_ext)).is_err());
+
+        // Both flags set: credential parses but the announced extension is missing.
+        let mut missing_ext = auth_data_prefix(
+            AuthenticatorDataFlags::ATTESTED.bits() | AuthenticatorDataFlags::EXTENSION_DATA.bits(),
+        );
+        missing_ext.extend_from_slice(&attested_credential_section());
+        assert!(from_slice::<AuthenticatorData>(&cbor_bytes(&missing_ext)).is_err());
+
+        // Extension data must be a CBOR map per the WebAuthn spec; an array is rejected.
+        let mut array_ext = auth_data_prefix(AuthenticatorDataFlags::EXTENSION_DATA.bits());
+        array_ext.push(0x80); // empty CBOR array
+        assert!(from_slice::<AuthenticatorData>(&cbor_bytes(&array_ext)).is_err());
+    }
+
+    #[test]
+    fn test_auth_data_rejects_trailing_bytes() {
+        // A flag-consistent blob must still fail if unrelated bytes trail the last section.
+        // This is the "flags say one thing, length says another" contradiction.
+
+        // No sections announced, yet bytes remain after the fixed prefix.
+        let mut trailing_plain = auth_data_prefix(0);
+        trailing_plain.extend_from_slice(&[0xAA, 0xBB]);
+        assert!(from_slice::<AuthenticatorData>(&cbor_bytes(&trailing_plain)).is_err());
+
+        // A complete attested credential followed by stray bytes (extension flag unset).
+        let mut trailing_cred = auth_data_prefix(AuthenticatorDataFlags::ATTESTED.bits());
+        trailing_cred.extend_from_slice(&attested_credential_section());
+        trailing_cred.push(0xAA);
+        assert!(from_slice::<AuthenticatorData>(&cbor_bytes(&trailing_cred)).is_err());
+
+        // A valid empty extension map followed by stray bytes.
+        let mut trailing_ext = auth_data_prefix(AuthenticatorDataFlags::EXTENSION_DATA.bits());
+        trailing_ext.extend_from_slice(&[0xA0, 0xAA]);
+        assert!(from_slice::<AuthenticatorData>(&cbor_bytes(&trailing_ext)).is_err());
+    }
+
+    #[test]
+    fn test_auth_data_accepts_well_formed_input() {
+        // A plain assertion with neither flag set and no trailing sections.
+        let plain = from_slice::<AuthenticatorData>(&cbor_bytes(&auth_data_prefix(
+            AuthenticatorDataFlags::USER_PRESENT.bits(),
+        )))
+        .expect("plain assertion should parse");
+        assert!(plain.credential_data.is_none());
+        assert!(!plain.extensions.has_some());
+
+        // ATTESTED with a complete attested credential and no extension data.
+        let mut attested = auth_data_prefix(AuthenticatorDataFlags::ATTESTED.bits());
+        attested.extend_from_slice(&attested_credential_section());
+        let parsed = from_slice::<AuthenticatorData>(&cbor_bytes(&attested))
+            .expect("attested credential should parse");
+        assert!(parsed.credential_data.is_some());
+        assert!(!parsed.extensions.has_some());
+
+        // EXTENSION_DATA with an empty CBOR map is legal and yields an empty Extension.
+        let mut empty_ext = auth_data_prefix(AuthenticatorDataFlags::EXTENSION_DATA.bits());
+        empty_ext.push(0xA0);
+        let parsed = from_slice::<AuthenticatorData>(&cbor_bytes(&empty_ext))
+            .expect("empty extension map should parse");
+        assert!(parsed.credential_data.is_none());
+        assert!(!parsed.extensions.has_some());
+
+        // Both flags set with a complete credential and a complete extension map.
+        let mut both = auth_data_prefix(
+            AuthenticatorDataFlags::ATTESTED.bits() | AuthenticatorDataFlags::EXTENSION_DATA.bits(),
+        );
+        both.extend_from_slice(&attested_credential_section());
+        both.push(0xA0);
+        let parsed = from_slice::<AuthenticatorData>(&cbor_bytes(&both))
+            .expect("credential plus extension should parse");
+        assert!(parsed.credential_data.is_some());
+        assert!(!parsed.extensions.has_some());
+
+        // A populated extension map round-trips into the typed Extension.
+        let mut populated = auth_data_prefix(AuthenticatorDataFlags::EXTENSION_DATA.bits());
+        // { "hmac-secret": true }
+        populated.extend_from_slice(&[0xA1, 0x6B]);
+        populated.extend_from_slice(b"hmac-secret");
+        populated.push(0xF5);
+        let parsed = from_slice::<AuthenticatorData>(&cbor_bytes(&populated))
+            .expect("populated extension map should parse");
+        assert_eq!(
+            parsed.extensions.hmac_secret,
+            Some(HmacSecretResponse::Confirmed(true))
+        );
     }
 
     /// See: https://github.com/mozilla/authenticator-rs/issues/187
