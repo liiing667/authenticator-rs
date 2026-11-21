@@ -23,6 +23,45 @@ pub enum UnsupportedOption {
 }
 
 #[derive(Debug)]
+pub enum LargeBlobError {
+    /// The authenticator rejected the write. The previously stored
+    /// large-blob array is unchanged.
+    WriteRejected,
+    /// A fragmented write failed after some fragments had already been
+    /// persisted. The stored array matches neither the previous nor the
+    /// new version and has to be considered corrupt.
+    PartiallyWritten,
+    /// The write reported success, but the authenticator still stores
+    /// the previous version of the large-blob array.
+    NotCommitted,
+    /// The write reported success, but the stored array matches neither
+    /// the previous nor the new version: it was modified concurrently.
+    ConcurrentModification,
+}
+
+impl fmt::Display for LargeBlobError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match *self {
+            LargeBlobError::WriteRejected => {
+                write!(f, "write rejected, previous large-blob array unchanged")
+            }
+            LargeBlobError::PartiallyWritten => {
+                write!(f, "large-blob array partially written and now corrupt")
+            }
+            LargeBlobError::NotCommitted => {
+                write!(
+                    f,
+                    "large-blob write did not commit, previous array unchanged"
+                )
+            }
+            LargeBlobError::ConcurrentModification => {
+                write!(f, "large-blob array was modified concurrently")
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
 pub enum AuthenticatorError {
     // Errors from external libraries...
     Io(io::Error),
@@ -38,6 +77,7 @@ pub enum AuthenticatorError {
     CryptoError,
     PinError(PinError),
     UnsupportedOption(UnsupportedOption),
+    LargeBlobError(LargeBlobError),
     CancelledByUser,
     CredentialExcluded,
 }
@@ -71,6 +111,9 @@ impl fmt::Display for AuthenticatorError {
             AuthenticatorError::PinError(ref e) => write!(f, "PIN Error: {e}"),
             AuthenticatorError::UnsupportedOption(ref e) => {
                 write!(f, "Unsupported option: {e:?}")
+            }
+            AuthenticatorError::LargeBlobError(ref e) => {
+                write!(f, "Large blob error: {e}")
             }
             AuthenticatorError::CancelledByUser => {
                 write!(f, "Cancelled by user.")

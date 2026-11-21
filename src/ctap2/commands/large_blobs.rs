@@ -5,7 +5,7 @@
 use crate::{
     crypto::{PinUvAuthParam, PinUvAuthToken},
     ctap2::server::UserVerificationRequirement,
-    errors::{AuthenticatorError, UnsupportedOption},
+    errors::{AuthenticatorError, LargeBlobError, UnsupportedOption},
     transport::errors::HIDError,
     FidoDevice,
 };
@@ -349,10 +349,13 @@ pub type LargeBlobSegment = Vec<u8>;
 
 impl CtapResponse for LargeBlobSegment {}
 
-pub fn read_large_blob_array<Dev>(
+/// Reads all fragments of the raw largeBlobs response and returns the
+/// concatenated bytes, i.e. the CBOR map wrapping the serialized
+/// large-blob array.
+fn read_large_blob_response<Dev>(
     dev: &mut Dev,
     keep_alive: &dyn Fn() -> bool,
-) -> Result<LargeBlobsResponse, AuthenticatorError>
+) -> Result<Vec<u8>, AuthenticatorError>
 where
     Dev: FidoDevice,
 {
@@ -399,6 +402,37 @@ where
             continue;
         }
     }
+    Ok(bytes)
+}
+
+/// Extracts the inner byte string (the serialized large-blob array,
+/// concatenated with its trailing 16 hash bytes) from a raw largeBlobs
+/// response, exactly as stored on the authenticator. In contrast to
+/// `read_large_blob_array`, no hash-verification or sanitizing is
+/// performed, so the result can be used to bind a write transaction to
+/// the currently stored version.
+fn extract_serialized_array(response: &[u8]) -> Result<Vec<u8>, CommandError> {
+    let value: Value = from_slice(response).map_err(CommandError::Deserializing)?;
+    if let Value::Map(map) = value {
+        for (key, val) in map {
+            if key == Value::Integer(0x01) {
+                if let Value::Bytes(bytes) = val {
+                    return Ok(bytes);
+                }
+            }
+        }
+    }
+    Err(CommandError::MissingRequiredField("large_blob_bytes"))
+}
+
+pub fn read_large_blob_array<Dev>(
+    dev: &mut Dev,
+    keep_alive: &dyn Fn() -> bool,
+) -> Result<LargeBlobsResponse, AuthenticatorError>
+where
+    Dev: FidoDevice,
+{
+    let bytes = read_large_blob_response(dev, keep_alive)?;
     let response: LargeBlobsResponse = from_slice(&bytes).map_err(CommandError::Deserializing)?;
     Ok(response)
 }
@@ -444,7 +478,12 @@ where
             pin_uv_auth_param: None,
         };
         cmd.set_pin_uv_auth_param(pin_uv_auth_token.clone())?;
-        dev.send_cbor_cancellable(&cmd, keep_alive, None)?;
+        if let Err(e) = dev.send_cbor_cancellable(&cmd, keep_alive, None) {
+            // All previous fragments may already be persisted on the
+            // authenticator, leaving a partially written array behind.
+            error!("Failed to write large blob fragment at offset {offset}/{total_length}: {e:?}");
+            return Err(e.into());
+        }
         offset += chunk_len as u64;
     }
     Ok(())
@@ -459,7 +498,13 @@ pub fn add_large_blob<Dev>(
 where
     Dev: FidoDevice,
 {
-    let mut array = read_large_blob_array(dev, keep_alive)?;
+    // Begin of the transaction: read the currently stored array and bind
+    // this write to its version, so that rejected, partial and concurrent
+    // writes can be told apart afterwards.
+    let response_bytes = read_large_blob_response(dev, keep_alive)?;
+    let previous = extract_serialized_array(&response_bytes)?;
+    let mut array: LargeBlobsResponse =
+        from_slice(&response_bytes).map_err(CommandError::Deserializing)?;
     // Adding it
     array.large_blob_array.push(blob);
     // Then rewriting the whole array
@@ -469,7 +514,73 @@ where
     hasher.update(&bytes);
     let hash = hasher.finalize();
     bytes.extend_from_slice(&hash[..16]);
-    write_large_blob_segment(dev, keep_alive, &bytes, 0, pin_uv_auth_token)
+
+    let write_result = write_large_blob_segment(dev, keep_alive, &bytes, 0, pin_uv_auth_token);
+
+    // End of the transaction: re-read the stored array and compare it
+    // against both the previous and the new version.
+    let current = match read_large_blob_response(dev, keep_alive) {
+        Ok(response) => extract_serialized_array(&response),
+        Err(e) => {
+            // We cannot determine the state the authenticator is in now.
+            warn!("Failed to verify large blob array after writing: {e:?}");
+            return match write_result {
+                Ok(()) => Err(e),
+                Err(write_err) => Err(write_err),
+            };
+        }
+    };
+    let current = match current {
+        Ok(current) => current,
+        Err(e) => {
+            warn!("Failed to parse large blob array after writing: {e:?}");
+            return match write_result {
+                Ok(()) => Err(e.into()),
+                Err(write_err) => Err(write_err),
+            };
+        }
+    };
+
+    if current == bytes {
+        // The new version is stored. If the write reported an error, it
+        // was either spurious or its response got lost.
+        if write_result.is_err() {
+            warn!("Large blob write reported an error, but the new version is stored.");
+        }
+        return Ok(());
+    }
+    if current == previous {
+        // The previous version is still stored, nothing was committed.
+        return match write_result {
+            Ok(()) => {
+                error!("Large blob write reported success, but was not committed.");
+                Err(AuthenticatorError::LargeBlobError(
+                    LargeBlobError::NotCommitted,
+                ))
+            }
+            Err(write_err) => {
+                error!("Large blob write rejected, previous array unchanged: {write_err:?}");
+                Err(AuthenticatorError::LargeBlobError(
+                    LargeBlobError::WriteRejected,
+                ))
+            }
+        };
+    }
+    // The stored array matches neither version.
+    match write_result {
+        Ok(()) => {
+            error!("Large blob array was modified concurrently.");
+            Err(AuthenticatorError::LargeBlobError(
+                LargeBlobError::ConcurrentModification,
+            ))
+        }
+        Err(write_err) => {
+            error!("Large blob array partially written and now corrupt: {write_err:?}");
+            Err(AuthenticatorError::LargeBlobError(
+                LargeBlobError::PartiallyWritten,
+            ))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -521,6 +632,105 @@ pub mod tests {
             device.add_write(&msg, 0);
         }
     }
+
+    fn add_error_to_read(cid: &[u8], status: u8, device: &mut Device) {
+        let mut data = Vec::new();
+        data.extend(1u16.to_be_bytes()); // payload_len: status-byte only
+        data.push(status);
+        let mut msg = cid.to_vec();
+        msg.push(HIDCmd::Cbor.into());
+        msg.extend(data);
+        device.add_read(&msg, 0);
+    }
+
+    fn add_get_command(cid: &[u8], offset: u64, max_fragment_length: u64, device: &mut Device) {
+        let mut cmd = vec![
+            0xa2, // map(2)
+            0x01, // unsigned(1) - get
+        ];
+        cmd.extend(&to_vec(&serde_cbor::Value::Integer(max_fragment_length as i128)).unwrap());
+        cmd.push(0x03); // unsigned(3) - offset
+        cmd.extend(&to_vec(&serde_cbor::Value::Integer(offset as i128)).unwrap());
+        let mut msg = cid.to_vec();
+        msg.extend(vec![HIDCmd::Cbor.into(), 0x00, cmd.len() as u8 + 1]); // cmd + bcnt
+        msg.extend(vec![0x0C]); // LargeBlobs
+        msg.extend(cmd); // Actual command
+        device.add_write(&msg, 0);
+    }
+
+    fn add_set_command(
+        cid: &[u8],
+        chunk: &[u8],
+        offset: u64,
+        total_length: Option<u64>,
+        device: &mut Device,
+    ) {
+        let mut cmd = vec![
+            0x0C,                                             // LargeBlobs
+            if total_length.is_some() { 0xa3 } else { 0xa2 }, // map(3) with 'length', map(2) without
+            0x02,                                             // unsigned(2) - set
+        ];
+        let chunk_len = chunk.len();
+        if chunk_len < 24 {
+            cmd.push(0x40 + chunk_len as u8);
+        } else if chunk_len < 256 {
+            cmd.extend([0x58, chunk_len as u8]);
+        } else {
+            cmd.extend([0x59, (chunk_len >> 8) as u8, (chunk_len & 0xff) as u8]);
+        }
+        cmd.extend(chunk);
+        cmd.push(0x03); // unsigned(3) - offset
+        cmd.extend(&to_vec(&serde_cbor::Value::Integer(offset as i128)).unwrap());
+        if let Some(total_length) = total_length {
+            cmd.push(0x04); // unsigned(4) - length
+            cmd.extend(&to_vec(&serde_cbor::Value::Integer(total_length as i128)).unwrap());
+        }
+        add_bytes_to_write(cid, &cmd, device);
+    }
+
+    /// Scripts all get-requests and responses needed to read `response`
+    /// from the device, using the given fragment length.
+    fn add_large_blob_read(
+        cid: &[u8],
+        response: &[u8],
+        max_fragment_length: u64,
+        device: &mut Device,
+    ) {
+        let mut offset = 0;
+        for chunk in response.chunks(max_fragment_length as usize) {
+            add_get_command(cid, offset, max_fragment_length, device);
+            offset += chunk.len() as u64;
+        }
+        for chunk in response.chunks(max_fragment_length as usize) {
+            add_bytes_to_read(cid, chunk, device);
+        }
+    }
+
+    /// Wraps a serialized large-blob array (including its trailing hash
+    /// bytes) into the CBOR map of a largeBlobs response.
+    fn wrap_large_blob_response(inner: &[u8]) -> Vec<u8> {
+        let mut response = vec![
+            0xa1, // map(1)
+            0x01, // unsigned(1)
+        ];
+        let inner_len = inner.len();
+        if inner_len < 24 {
+            response.push(0x40 + inner_len as u8);
+        } else if inner_len < 256 {
+            response.extend([0x58, inner_len as u8]);
+        } else {
+            response.extend([0x59, (inner_len >> 8) as u8, (inner_len & 0xff) as u8]);
+        }
+        response.extend_from_slice(inner);
+        response
+    }
+
+    /// The initial serialized large-blob array of a fresh authenticator:
+    /// an empty CBOR array, followed by LEFT(SHA-256(h'80'), 16).
+    const DEFAULT_LARGE_BLOB: [u8; 17] = [
+        0x80, 0x76, 0xbe, 0x8b, 0x52, 0x8d, 0x00, 0x75, 0xf7, 0xaa, 0xe9, 0x8d, 0x6f, 0xa5, 0x7a,
+        0x6d, 0x3c,
+    ];
 
     #[test]
     fn test_read_large_blob_array() {
@@ -671,6 +881,14 @@ pub mod tests {
         // empty success-command
         add_bytes_to_read(&cid, &[], &mut device);
 
+        // The transaction verification re-reads the now stored array
+        add_large_blob_read(
+            &cid,
+            &wrap_large_blob_response(&LARGE_BLOB_ARRAY_LONGER),
+            960,
+            &mut device,
+        );
+
         let add_parsed = additional_blob_element();
         add_large_blob(&mut device, &keep_alive, add_parsed, None)
             .expect("Failed to write add large blob element");
@@ -742,9 +960,200 @@ pub mod tests {
             add_bytes_to_read(&cid, &[], &mut device);
         }
 
+        // The transaction verification re-reads the now stored array
+        add_large_blob_read(
+            &cid,
+            &wrap_large_blob_response(&LARGE_BLOB_ARRAY_LONGER),
+            100,
+            &mut device,
+        );
+
         let add_parsed = additional_blob_element();
         add_large_blob(&mut device, &keep_alive, add_parsed, None)
             .expect("Failed to write add large blob element");
+    }
+
+    #[test]
+    fn test_add_large_blob_write_rejected() {
+        // The final fragment is rejected with CTAP2_ERR_INTEGRITY_FAILURE
+        // (e.g. the authenticator computed a different hash). The previous
+        // array is still stored unchanged.
+        let keep_alive = || true;
+        let mut device = Device::new_pre_inited(
+            "commands/large_blob",
+            Capability::CBOR | Capability::NMSG | Capability::WINK,
+        );
+        let cid = *device.get_cid();
+        device.set_authenticator_info(crate::AuthenticatorInfo {
+            max_msg_size: Some(164), // Note: This value minus 64 will be the fragment size
+            ..Default::default()
+        });
+
+        // First we read the whole existing array
+        add_large_blob_read(&cid, &LARGE_BLOB_ARRAY, 100, &mut device);
+
+        // All fragments are written, but the last one is rejected
+        let mut offset = 0;
+        for (ii, chunk) in LARGE_BLOB_ARRAY_LONGER.chunks(100).enumerate() {
+            add_set_command(
+                &cid,
+                chunk,
+                offset,
+                if ii == 0 {
+                    Some(LARGE_BLOB_ARRAY_LONGER.len() as u64)
+                } else {
+                    None
+                },
+                &mut device,
+            );
+            offset += chunk.len() as u64;
+        }
+        let num_chunks = LARGE_BLOB_ARRAY_LONGER.chunks(100).len();
+        for ii in 0..num_chunks {
+            if ii == num_chunks - 1 {
+                add_error_to_read(&cid, 0x3D, &mut device); // CTAP2_ERR_INTEGRITY_FAILURE
+            } else {
+                add_bytes_to_read(&cid, &[], &mut device);
+            }
+        }
+
+        // The verification read finds the previous array still intact
+        add_large_blob_read(&cid, &LARGE_BLOB_ARRAY, 100, &mut device);
+
+        let err = add_large_blob(&mut device, &keep_alive, additional_blob_element(), None)
+            .expect_err("Large blob write should have been rejected");
+        assert!(matches!(
+            err,
+            AuthenticatorError::LargeBlobError(LargeBlobError::WriteRejected)
+        ));
+    }
+
+    #[test]
+    fn test_add_large_blob_partially_written() {
+        // The second fragment is rejected with CTAP2_ERR_INVALID_SEQ (the
+        // authenticator lost track of the fragment offsets). The first
+        // fragment was already persisted, corrupting the stored array.
+        let keep_alive = || true;
+        let mut device = Device::new_pre_inited(
+            "commands/large_blob",
+            Capability::CBOR | Capability::NMSG | Capability::WINK,
+        );
+        let cid = *device.get_cid();
+        device.set_authenticator_info(crate::AuthenticatorInfo {
+            max_msg_size: Some(164), // Note: This value minus 64 will be the fragment size
+            ..Default::default()
+        });
+
+        // First we read the whole existing array
+        add_large_blob_read(&cid, &LARGE_BLOB_ARRAY, 100, &mut device);
+
+        // The first fragment is written successfully, the second one fails
+        add_set_command(
+            &cid,
+            &LARGE_BLOB_ARRAY_LONGER[..100],
+            0,
+            Some(LARGE_BLOB_ARRAY_LONGER.len() as u64),
+            &mut device,
+        );
+        add_set_command(
+            &cid,
+            &LARGE_BLOB_ARRAY_LONGER[100..200],
+            100,
+            None,
+            &mut device,
+        );
+        add_bytes_to_read(&cid, &[], &mut device);
+        add_error_to_read(&cid, 0x04, &mut device); // CTAP2_ERR_INVALID_SEQ
+
+        // The verification read finds neither the previous nor the new array
+        add_large_blob_read(
+            &cid,
+            &wrap_large_blob_response(&DEFAULT_LARGE_BLOB),
+            100,
+            &mut device,
+        );
+
+        let err = add_large_blob(&mut device, &keep_alive, additional_blob_element(), None)
+            .expect_err("Large blob write should have failed");
+        assert!(matches!(
+            err,
+            AuthenticatorError::LargeBlobError(LargeBlobError::PartiallyWritten)
+        ));
+    }
+
+    #[test]
+    fn test_add_large_blob_concurrent_modification() {
+        // The write succeeds, but a concurrent writer stored a different
+        // array before our verification read.
+        let keep_alive = || true;
+        let mut device = Device::new_pre_inited(
+            "commands/large_blob",
+            Capability::CBOR | Capability::NMSG | Capability::WINK,
+        );
+        let cid = *device.get_cid();
+
+        // First we read the whole existing array
+        add_large_blob_read(&cid, &LARGE_BLOB_ARRAY, 960, &mut device);
+
+        // The write succeeds
+        add_set_command(
+            &cid,
+            &LARGE_BLOB_ARRAY_LONGER,
+            0,
+            Some(LARGE_BLOB_ARRAY_LONGER.len() as u64),
+            &mut device,
+        );
+        add_bytes_to_read(&cid, &[], &mut device);
+
+        // The verification read finds a concurrently modified array
+        add_large_blob_read(
+            &cid,
+            &wrap_large_blob_response(&DEFAULT_LARGE_BLOB),
+            960,
+            &mut device,
+        );
+
+        let err = add_large_blob(&mut device, &keep_alive, additional_blob_element(), None)
+            .expect_err("Large blob write should have detected the concurrent modification");
+        assert!(matches!(
+            err,
+            AuthenticatorError::LargeBlobError(LargeBlobError::ConcurrentModification)
+        ));
+    }
+
+    #[test]
+    fn test_add_large_blob_not_committed() {
+        // The write reports success, but the authenticator still stores
+        // the previous array.
+        let keep_alive = || true;
+        let mut device = Device::new_pre_inited(
+            "commands/large_blob",
+            Capability::CBOR | Capability::NMSG | Capability::WINK,
+        );
+        let cid = *device.get_cid();
+
+        // First we read the whole existing array
+        add_large_blob_read(&cid, &LARGE_BLOB_ARRAY, 960, &mut device);
+
+        // The write succeeds
+        add_set_command(
+            &cid,
+            &LARGE_BLOB_ARRAY_LONGER,
+            0,
+            Some(LARGE_BLOB_ARRAY_LONGER.len() as u64),
+            &mut device,
+        );
+        add_bytes_to_read(&cid, &[], &mut device);
+
+        // The verification read finds the previous array still intact
+        add_large_blob_read(&cid, &LARGE_BLOB_ARRAY, 960, &mut device);
+
+        let err = add_large_blob(&mut device, &keep_alive, additional_blob_element(), None)
+            .expect_err("Large blob write should not have been committed");
+        assert!(matches!(
+            err,
+            AuthenticatorError::LargeBlobError(LargeBlobError::NotCommitted)
+        ));
     }
 
     fn additional_blob_element() -> LargeBlobArrayElement {
